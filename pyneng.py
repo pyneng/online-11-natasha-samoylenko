@@ -342,7 +342,7 @@ def cli(tasks, disable_verbose, answer, check, debug):
     Флаг -c сдает на проверку задания (пишет комментарий на github)
     для которых прошли тесты.
     Для сдачи заданий на проверку надо сгенерировать токен github.
-    Подробнее в инструкции: https://pyneng.github.io/docs/ptest-prepare/
+    Подробнее в инструкции: https://pyneng.github.io/docs/pyneng-prepare/
     """
     if not debug:
         sys.excepthook = exception_handler
@@ -381,7 +381,7 @@ def cli(tasks, disable_verbose, answer, check, debug):
                 raise PynengError(
                     red(
                         "Для сдачи заданий на проверку надо сгенерировать токен github. "
-                        "Подробнее в инструкции: https://pyneng.github.io/docs/ptest-prepare/"
+                        "Подробнее в инструкции: https://pyneng.github.io/docs/pyneng-prepare/"
                     )
                 )
             send_tasks_to_check(passed_tasks)
