@@ -2,16 +2,24 @@ import sys
 import subprocess
 import re
 import os
+from pprint import pprint
 from collections import defaultdict
+import tempfile
 import json
 import pathlib
+from getpass import getpass
 import stat
 import shutil
+from datetime import datetime, timedelta
 from glob import glob
 
+
 import click
+import yaml
 import pytest
 from pytest_jsonreport.plugin import JSONReport
+import requests
+import github
 
 
 task_dirs = [
@@ -34,9 +42,9 @@ task_dirs = [
 ]
 
 
-class PtestError(Exception):
+class PynengError(Exception):
     """
-    Ошибка в использовании/работе скрипта ptest
+    Ошибка в использовании/работе скрипта pyneng
     """
 
 
@@ -128,9 +136,72 @@ def call_command(command, verbose=True, return_stdout=False):
     return result.returncode
 
 
+def post_comment_to_last_commit(msg, repo, delta_days=14):
+    """
+    Написать комментарий о сдаче заданий в последнем коммите.
+    Комментарий пишется через Github API.
+
+    Для работы функции должен быть настроен git.
+    Функция пытается определить имя пользователя git из вывода git config --list,
+    Если это не получается, запрашивает имя пользователя.
+
+    Пароль берется из переменной окружения GITHUB_PASS или запрашивается.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    since = datetime.now() - timedelta(days=delta_days)
+    repo_name = f"pyneng/{repo}"
+
+    try:
+        g = github.Github(token)
+        repo_obj = g.get_repo(repo_name)
+    except github.GithubException:
+        raise PynengError(red(
+            "Аутентификация по токену не прошла. Задание не сдано на проверку"
+        ))
+    else:
+        commits = repo_obj.get_commits(since=since)
+
+        try:
+            last = commits[0]
+        except IndexError:
+            print("За указанный период времени не найдено коммитов")
+        else:
+            last.create_comment(msg)
+
+
+def send_tasks_to_check(passed_tasks):
+    """
+    Функция отбирает все задания, которые прошли
+    тесты при вызове pyneng, делает git add для файлов заданий,
+    git commit с сообщением какие задания сделаны
+    и git push для добавления изменений на Github.
+    После этого к этому коммиту добавляется сообщение о том,
+    что задания сдаются на проверку с помощью функции post_comment_to_last_commit.
+    """
+    ok_tasks = [test.replace("test_", "") for test in passed_tasks]
+    tasks_num_only = sorted([task.replace("task_", "").replace(".py", "") for task in ok_tasks])
+    message = f"Сделаны задания {' '.join(tasks_num_only)}"
+
+    for task in ok_tasks:
+        call_command(f"git add {task}")
+    call_command(f'git commit -m "{message}"')
+    call_command("git push origin master")
+
+    git_remote = call_command("git remote -v", return_stdout=True)
+    repo_match = re.search(r"online-\d+-\w+-\w+", git_remote)
+    if repo_match:
+        repo = repo_match.group()
+    else:
+        raise PynengError(red(
+            "Не найден репозиторий online-10-имя-фамилия. "
+            "pyneng надо вызывать в репозитории подготовленном для курса."
+        ))
+    post_comment_to_last_commit(message, repo)
+
+
 def current_chapter_id():
     """
-    Функция возвращает номер текущего раздела, где вызывается ptest.
+    Функция возвращает номер текущего раздела, где вызывается pyneng.
     """
     pth = str(pathlib.Path().absolute())
     last_dir = os.path.split(pth)[-1]
@@ -165,11 +236,8 @@ def parse_json_report(report):
 
 def copy_answers(passed_tasks):
     """
-    Функция клонирует репозиторий с ответами в домашний каталог пользователя
-    копирует ответы для заданий, которые прошли тесты.
-    После того как ответы скопированы, репозиторий с ответами удаляется.
-    Все это выполняется вручную, а не через tempfile, из-за проблем
-    с удалением на Windows.
+    Функция клонирует репозиторий с ответами и копирует ответы для заданий,
+    которые прошли тесты.
     """
     pth = str(pathlib.Path().absolute())
     current_chapter_name = os.path.split(pth)[-1]
@@ -193,7 +261,7 @@ def copy_answers(passed_tasks):
         os.chdir(homedir)
         shutil.rmtree("pyneng-answers", onerror=remove_readonly)
     else:
-        raise PtestError(red("Не получилось скопировать ответы."))
+        raise PynengError(red("Не получилось скопировать ответы."))
     os.chdir(pth)
 
 
@@ -239,24 +307,42 @@ def copy_answer_files(passed_tasks, pth):
         "не выводится traceback для тестов."
     ),
 )
+@click.option(
+    "--check",
+    "-c",
+    is_flag=True,
+    help=(
+        "Сдать задания на проверку. "
+        "При добавлении этого флага, "
+        "не выводится traceback для тестов."
+    ),
+)
 @click.option("--debug", is_flag=True, help="Показывать traceback исключений")
-def cli(tasks, disable_verbose, answer, debug):
+def cli(tasks, disable_verbose, answer, check, debug):
     """
     Запустить тесты для заданий TASKS. По умолчанию запустятся все тесты.
 
     Примеры запуска:
 
     \b
-        ptest            запустить все тесты для текущего раздела
-        ptest 1,2a,5     запустить тесты для заданий 1, 2a и 5
-        ptest 1,2a-c,5   запустить тесты для заданий 1, 2a, 2b, 2c и 5
-        ptest 1,2*       запустить тесты для заданий 1, все задания 2 с буквами и без
-        ptest 1,3-5      запустить тесты для заданий 1, 3, 4, 5
-        ptest 1-5 -a     запустить тесты и записать ответы на задания,
+        pyneng            запустить все тесты для текущего раздела
+        pyneng 1,2a,5     запустить тесты для заданий 1, 2a и 5
+        pyneng 1,2a-c,5   запустить тесты для заданий 1, 2a, 2b, 2c и 5
+        pyneng 1,2*       запустить тесты для заданий 1, все задания 2 с буквами и без
+        pyneng 1,3-5      запустить тесты для заданий 1, 3, 4, 5
+        pyneng 1-5 -a     запустить тесты и записать ответы на задания,
                          которые прошли тесты, в файлы answer_task_x.py
+        pyneng 1-5 -c     запустить тесты и сдать на проверку задания,
+                         которые прошли тесты.
+        pyneng -a -c      запустить все тесты, записать ответы на задания
+                         и сдать на проверку задания, которые прошли тесты.
 
     Флаг -d отключает подробный вывод pytest, который включен по умолчанию.
     Флаг -a записывает ответы в файлы answer_task_x.py, если тесты проходят.
+    Флаг -c сдает на проверку задания (пишет комментарий на github)
+    для которых прошли тесты.
+    Для сдачи заданий на проверку надо сгенерировать токен github.
+    Подробнее в инструкции: https://pyneng.github.io/docs/ptest-prepare/
     """
     if not debug:
         sys.excepthook = exception_handler
@@ -269,9 +355,9 @@ def cli(tasks, disable_verbose, answer, debug):
     else:
         pytest_args = [*pytest_args_common, "-vv"]
 
-    # если добавлен флаг -a нет смысла выводить traceback,
+    # если добавлен флаг -a или -c нет смысла выводить traceback,
     # так как скорее всего задания уже проверены предыдущими запусками.
-    if answer:
+    if answer or check:
         pytest_args = [*pytest_args_common, "--tb=no"]
 
     # запуск pytest
@@ -283,9 +369,22 @@ def cli(tasks, disable_verbose, answer, debug):
     # получить результаты pytest в формате JSON
     passed_tasks = parse_json_report(json_plugin.report)
 
-    # скопировать ответы в файлы answer_task_x.py
-    if passed_tasks and answer:
-        copy_answers(passed_tasks)
+    if passed_tasks:
+        # скопировать ответы в файлы answer_task_x.py
+        if answer:
+            copy_answers(passed_tasks)
+
+        # сдать задания на проверку через github API
+        if check:
+            token = os.environ.get("GITHUB_TOKEN")
+            if not token:
+                raise PynengError(
+                    red(
+                        "Для сдачи заданий на проверку надо сгенерировать токен github. "
+                        "Подробнее в инструкции: https://pyneng.github.io/docs/ptest-prepare/"
+                    )
+                )
+            send_tasks_to_check(passed_tasks)
 
 
 if __name__ == "__main__":
