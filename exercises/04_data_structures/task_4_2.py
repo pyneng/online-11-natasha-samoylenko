@@ -15,3 +15,4 @@
 """
 
 mac = "AAAA:BBBB:CCCC"
+print("AAAA.BBBB.CCCC")
